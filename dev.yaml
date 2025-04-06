@@ -1,10 +1,1 @@
-template-file-path: enviroment.yml
-
-parameters:
-  PrivateSubnet1CIDR: 10.0.3.0/24
-  PublicSubnet2CIDR: 10.0.2.0/24
-  VpcCIDR: 10.0.0.0/16
-  DBAllocatedStorage: '20'
-  EnvironmentName: week8project
-  PrivateSubnet2CIDR: 10.0.4.0/24
- 
+template-file-path: resources.yml

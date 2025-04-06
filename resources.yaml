@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Combined Frontend Components and ECS Deployment with Improved Health Checks'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name that will be prefixed to resource names
+    Type: String
+    Default: 'week8project'
+
+  FrontendContainerImage:
+    Description: Frontend container image to use (should be a valid public image)
+    Type: String
+    Default: 'public.ecr.aws/m9u6i6o1/week8/todo:image-todo-frontend'
+
+  BackendContainerImage:
+    Description: Backend container image to use (should be a valid public image)
+    Type: String
+    Default: 'public.ecr.aws/m9u6i6o1/week8/todo:image-todo-backend'
+
+  TaskCount:
+    Description: Number of tasks to run in the service
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  ServiceName:
+    Description: Name of the ECS service
+    Type: String
+    Default: 'frontend-service'
+
+Resources:
+  # ECS Task Roles - Added DynamoDB full access
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ecs-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - 'arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess'
+    
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess'
+
+  # Network Configuration - Security Group for ALB to ECS communication
+  ECSIngressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow traffic from ALB to ECS containers'
+      VpcId:
+        Fn::ImportValue: !Sub '${EnvironmentName}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ecs-ingress-sg'
+
+  # ECS Cluster Resources
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-cluster'
+
+  # Frontend Load Balancer
+  FrontendLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-frontend-ALB'
+      Subnets:
+        - Fn::ImportValue: !Sub '${EnvironmentName}-PublicSubnet1'
+        - Fn::ImportValue: !Sub '${EnvironmentName}-PublicSubnet2'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${EnvironmentName}-ALBSecurityGroupId'
+      Scheme: internet-facing
+      Type: application
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-ALB'
+
+  # Frontend Target Group - Improved Health Check Settings
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-frontend-TG'
+      Port: 80
+      Protocol: HTTP
+      VpcId: 
+        Fn::ImportValue: !Sub '${EnvironmentName}-VpcId'
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15      # Reduced from 30
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '80'
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3          # Increased to avoid premature failures
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'                      # Reduced from default 300s
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-TG'
+
+  # Frontend ALB Listener
+  FrontendALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - FrontendLoadBalancer
+      - FrontendTargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+      LoadBalancerArn: !Ref FrontendLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Green Target Group for Blue/Green Deployment
+  FrontendGreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-front-g-TG'
+      Port: 80
+      Protocol: HTTP
+      VpcId: 
+        Fn::ImportValue: !Sub '${EnvironmentName}-VpcId'
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '80'
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-green-TG'
+
+  # Backend Target Group
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-backend-TG'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: 
+        Fn::ImportValue: !Sub '${EnvironmentName}-VpcId'
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8080'
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-TG'
+
+  # Backend Green Target Group for Blue/Green Deployment
+  BackendGreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-backend-green-TG'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: 
+        Fn::ImportValue: !Sub '${EnvironmentName}-VpcId'
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8080'
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '20'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-green-TG'
+
+  # Backend Load Balancer
+  BackendLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-backend-ALB'
+      Subnets:
+        - Fn::ImportValue: !Sub '${EnvironmentName}-PublicSubnet1'
+        - Fn::ImportValue: !Sub '${EnvironmentName}-PublicSubnet2'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${EnvironmentName}-ALBSecurityGroupId'
+      Scheme: internet-facing
+      Type: application
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-ALB'
+
+  # Backend ALB Listener
+  BackendALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - BackendLoadBalancer
+      - BackendTargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+      LoadBalancerArn: !Ref BackendLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Log Groups
+  FrontendCloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-frontend'
+      RetentionInDays: 30
+
+  BackendCloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-backend'
+      RetentionInDays: 30
+
+  # Frontend Task Definition - Removed S3, RDS environment variables
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-frontend-task'
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub '${EnvironmentName}-frontend-container'
+          Image: !Ref FrontendContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendCloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: BACKEND_API_URL
+              Value: !Sub 'http://${BackendLoadBalancer.DNSName}'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:80/ || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-TaskDefinition'
+
+  # Backend Task Definition - Removed S3, RDS environment variables
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-backend-task'
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub '${EnvironmentName}-backend-container'
+          Image: !Ref BackendContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendCloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8080 || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-TaskDefinition'
+
+  # CodeDeploy Resources
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-codedeploy-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS'
+
+  # CodeDeploy Applications
+  FrontendCodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${EnvironmentName}-frontend-app'
+      ComputePlatform: ECS
+
+  BackendCodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${EnvironmentName}-backend-app'
+      ComputePlatform: ECS
+
+  # ECS Services
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - FrontendALBListener
+      - CodeDeployServiceRole
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: !Sub '${EnvironmentName}-frontend-service'
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: !Ref TaskCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSIngressSecurityGroup
+            - Fn::ImportValue: !Sub '${EnvironmentName}-ECSSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue: !Sub '${EnvironmentName}-PrivateSubnet1'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-PrivateSubnet2'
+          AssignPublicIp: ENABLED  # Changed to ENABLED to allow internet access
+      LoadBalancers:
+        - ContainerName: !Sub '${EnvironmentName}-frontend-container'
+          ContainerPort: 80
+          TargetGroupArn: !Ref FrontendTargetGroup
+      DeploymentController:
+        Type: CODE_DEPLOY
+      HealthCheckGracePeriodSeconds: 120
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-service'
+
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - BackendALBListener
+      - CodeDeployServiceRole
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: !Sub '${EnvironmentName}-backend-service'
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref TaskCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSIngressSecurityGroup
+            - Fn::ImportValue: !Sub '${EnvironmentName}-ECSSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue: !Sub '${EnvironmentName}-PrivateSubnet1'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-PrivateSubnet2'
+          AssignPublicIp: ENABLED  # Changed to ENABLED to allow internet access
+      LoadBalancers:
+        - ContainerName: !Sub '${EnvironmentName}-backend-container'
+          ContainerPort: 8080
+          TargetGroupArn: !Ref BackendTargetGroup
+      DeploymentController:
+        Type: CODE_DEPLOY
+      HealthCheckGracePeriodSeconds: 120
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-service'
+
+  # CodeDeploy Deployment Groups
+  FrontendDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: 
+      - FrontendService
+      - FrontendALBListener
+    Properties:
+      ApplicationName: !Ref FrontendCodeDeployApplication
+      DeploymentGroupName: !Sub '${EnvironmentName}-frontend-dg'
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: STOP_DEPLOYMENT
+          WaitTimeInMinutes: 20
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 3
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      ECSServices:
+        - ClusterName: !Ref ECSCluster
+          ServiceName: !GetAtt FrontendService.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref FrontendALBListener
+            TargetGroups:
+              - Name: !GetAtt FrontendTargetGroup.TargetGroupName
+              - Name: !GetAtt FrontendGreenTargetGroup.TargetGroupName
+
+  BackendDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: 
+      - BackendService
+      - BackendALBListener
+    Properties:
+      ApplicationName: !Ref BackendCodeDeployApplication
+      DeploymentGroupName: !Sub '${EnvironmentName}-backend-dg'
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: STOP_DEPLOYMENT
+          WaitTimeInMinutes: 20
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 3
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      ECSServices:
+        - ClusterName: !Ref ECSCluster
+          ServiceName: !GetAtt BackendService.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref BackendALBListener
+            TargetGroups:
+              - Name: !GetAtt BackendTargetGroup.TargetGroupName
+              - Name: !GetAtt BackendGreenTargetGroup.TargetGroupName
+
+Outputs:
+  FrontendAlbDnsName:
+    Description: DNS name of the Frontend Application Load Balancer
+    Value: !GetAtt FrontendLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${EnvironmentName}-FrontendAlbDnsName'
+
+  BackendAlbDnsName:
+    Description: DNS name of the Backend Application Load Balancer
+    Value: !GetAtt BackendLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${EnvironmentName}-BackendAlbDnsName'
+
+  ClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${EnvironmentName}-ClusterName'
+  
+  FrontendServiceName:
+    Description: Frontend ECS Service Name
+    Value: !GetAtt FrontendService.Name
+    Export:
+      Name: !Sub '${EnvironmentName}-FrontendServiceName'
+
+  BackendServiceName:
+    Description: Backend ECS Service Name
+    Value: !GetAtt BackendService.Name
+    Export:
+      Name: !Sub '${EnvironmentName}-BackendServiceName'
+
+  # Export the newly created IAM roles
+  ECSTaskRoleArn:
+    Description: ARN of the ECS Task Role
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-ECSTaskRoleArn'
+
+  ECSTaskExecutionRoleArn:
+    Description: ARN of the ECS Task Execution Role
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-ECSTaskExecutionRoleArn'
