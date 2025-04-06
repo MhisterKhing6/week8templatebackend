@@ -1,1 +1,8 @@
-template-file-path: resources.yml
+template-file-path: resources.yaml
+parameters:
+  EnvironmentName: week8project
+  ServiceName: frontend-service
+  TaskCount: '2'
+  BackendContainerImage: public.ecr.aws/m9u6i6o1/week8/todo:image-todo-backend
+  FrontendContainerImage: public.ecr.aws/m9u6i6o1/week8/todo:image-todo-frontend
+tags: {}
