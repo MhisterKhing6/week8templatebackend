@@ -98,12 +98,23 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-PrivateSubnet1'
 
-  PrivateSubnet2:
+  PrivateSubnet3:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       AvailabilityZone: !Select [1, !GetAZs '']
       CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-PrivateSubnet2'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet5CIDR
       MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
