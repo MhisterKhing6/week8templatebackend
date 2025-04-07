@@ -1,4 +1,4 @@
-template-file-path: enviroment.yml
+template-file-path: enviroment.yaml
 
 parameters:
   PrivateSubnet1CIDR: 10.0.3.0/24
