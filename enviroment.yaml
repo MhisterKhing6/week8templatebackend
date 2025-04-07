@@ -32,6 +32,11 @@ Parameters:
     Type: String
     Default: '10.0.4.0/24'
 
+  PrivateSubnet5CIDR:
+    Description: CIDR block for Private Subnet 1
+    Type: String
+    Default: '10.0.5.0/24'
+
 Resources:
   # VPC
   VPC:
